@@ -1,0 +1,137 @@
+# SRC2500 PXE Boot 测试快速参考卡片
+
+## 一键测试命令
+
+```bash
+# 完整测试
+sudo ~/test-script.sh
+
+# 首次启动测试
+sudo ~/test-script.sh --first-boot
+
+# 重启验证测试
+sudo ~/test-script.sh --reboot
+```
+
+---
+
+## 快速检查命令
+
+### 1. 分区检查
+```bash
+lsblk -o NAME,SIZE,PARTLABEL,MOUNTPOINT | grep -E "(pxe_|log)"
+```
+**预期**: 显示 4 个 PXE 分区
+
+### 2. 挂载点检查
+```bash
+mount | grep -E "(pxe_|log)"
+```
+**预期**: 所有分区已挂载
+
+### 3. systemd 服务检查
+```bash
+systemctl list-units '*.mount' | grep -E "(pxe|log)"
+```
+**预期**: 显示 4 个 active (mounted) 状态
+
+### 4. 分区大小检查
+```bash
+lsblk -o NAME,SIZE,PARTLABEL | grep -E "(pxe_|log)"
+```
+**预期**:
+- pxe_rootfs_a: 2G
+- pxe_rootfs_b: 2G
+- pxe_upper: 28G
+- log: 80G (取决于 eMMC)
+
+### 5. 日志检查
+```bash
+journalctl -u pxeboot-init.service -n 50 --no-pager
+```
+**预期**: 无错误或警告
+
+---
+
+## 测试验证清单
+
+### 第一次启动（烧录新镜像后）
+- [ ] 分区创建成功（4 个 PXE 分区）
+- [ ] 所有分区已挂载
+- [ ] systemd mount 单元 active
+- [ ] 文件系统可读写
+- [ ] 服务日志无错误
+
+### 第二次启动（验证幂等性）
+- [ ] 脚本输出 "already exist"
+- [ ] 分区表无变化
+- [ ] 挂载状态正常
+
+### 重启后（验证持久化）
+- [ ] 分区自动挂载
+- [ ] 测试文件完整
+- [ ] systemd mount 单元正常
+
+---
+
+## 分区布局速查
+
+| 分区名 | 大小 | 起始扇区 | 挂载点 |
+|--------|------|---------|--------|
+| pxe_rootfs_a | 2GB | 0x2000000 | /pxe_rootfs_a |
+| pxe_rootfs_b | 2GB | 0x2400000 | /pxe_rootfs_b |
+| pxe_upper | 28GB | 0x2800000 | /pxe_upper |
+| log | 剩余 | 0x6000000 | /log |
+
+---
+
+## 常见问题排查
+
+### 问题: 分区未创建
+**检查**:
+```bash
+systemctl status pxeboot-init.service
+journalctl -u pxeboot-init.service
+```
+
+### 问题: 分区未挂载
+**检查**:
+```bash
+systemctl status pxe\x2drootfs\x2da.mount
+cat /etc/systemd/system/pxe\x2drootfs\x2da.mount
+```
+
+### 问题: 文件系统只读
+**检查**:
+```bash
+mount | grep pxe
+df -h | grep pxe
+```
+
+---
+
+## UUID 速查
+
+```
+pxe_rootfs_a: 614e0000-0000-4b53-8000-1d28000054c0
+pxe_rootfs_b: 614e0000-0000-4b53-8000-1d28000054c1
+pxe_upper:    614e0000-0000-4b53-8000-1d28000054c2
+log:          614e0000-0000-4b53-8000-1d28000054c8
+```
+
+---
+
+## 测试通过标准
+
+- ✅ P0 用例 100% 通过（4/4）
+- ✅ P0+P1 用例 ≥80% 通过（≥4/5）
+- ✅ P0+P1+P2 用例 ≥70% 通过（≥5/7）
+
+---
+
+## 联系支持
+
+**文档路径**:
+- 设计: `/home/linke/processor_sdk/.ai_context/src2500-pxeboot-partition-20250331/01-architecture/design.md`
+- 实现: `/home/linke/processor_sdk/.ai_context/src2500-pxeboot-partition-20250331/02-development/implementation-notes.md`
+- 测试: `/home/linke/processor_sdk/.ai_context/src2500-pxeboot-partition-20250331/03-testing/`
