@@ -1,0 +1,8 @@
+TMUX_SESSION=work-0
+WORKSPACE=/home/linke/processor_sdk/.ai_context/refactor-ubuntu22.04-build-1775117531
+TASKS_DIR=/home/linke/.claude/tasks/5cdc3579-66a9-4ca7-bcc3-d6d8f80bd90e
+LEADER_PANE=%0
+TASKS_PANE=%1
+LOGS_PANE=%2
+STATUS_PANE=%3
+CREATED_AT=Thu Apr  2 16:13:12 CST 2026

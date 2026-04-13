@@ -145,7 +145,7 @@
 - 使用自动化脚本验证所有扇区计算
 - 分区无缝连接（无间隙）
 
-### 问题 2: systemd mount 单元命名转义
+### 问题 2: systemd mount 单元命名转义（第一次尝试）
 
 **现象**:
 - 分区名包含 `-` 字符（如 `pxe_rootfs_a`）
@@ -155,11 +155,16 @@
 - systemd unit 文件名要求特殊字符转义
 - `-` 必须转义为 `\x2d`
 
-**解决方案**:
+**第一次尝试的解决方案**:
 ```bash
 MOUNT_UNIT="${PART_NAME//-/\\x2d}.mount"
 # pxe_rootfs_a → pxe\x2drootfs\x2da.mount
 ```
+
+**实际问题**:
+- 这个方案只转义了**分区名**，但 systemd 的 mount 单元文件名是从**完整挂载路径**转换而来
+- 挂载路径 `/media/root-rw/pxe_src2500/lower_a` 包含多个 `-` 字符
+- 路径中的 `-` 也需要转义
 
 **预防措施**:
 - 在实现笔记中记录所有转义规则
@@ -202,6 +207,175 @@ PART_DEV="${BOOT_DEV}p${PART_NUM}"
 
 ---
 
+### 问题 5: systemd mount 单元文件名转义规则（完整修复）
+
+**发现日期**: 2025-04-02
+**影响**: 导致脚本运行失败，挂载单元无法启动
+
+**现象**:
+```bash
+# 使用 sed 转义路径
+MOUNT_UNIT="$(echo /media/root-rw/log | sed 's/^\///;s/\//-/g').mount"
+# 生成：media-root-rw-log.mount
+
+# systemd 验证失败
+systemd-analyze verify media-root-rw-log.mount
+# 错误：Where= setting doesn't match unit name. Refusing.
+```
+
+**根本原因**:
+systemd mount 单元文件名必须与挂载路径完全匹配，转换规则为：
+1. 去掉开头的 `/`
+2. 将 `/` 替换为 `-`
+3. **将 `-` 替换为 `\x2d`**（字面的 4 个字符：`\` `x` `2` `d`）
+
+**示例**:
+| 挂载路径 | 错误的单元名 | 正确的单元名 |
+|---------|-------------|-------------|
+| `/media/root-rw/log` | `media-root-rw-log.mount` | `media-root\x2drw-log.mount` |
+| `/media/root-rw/pxe_src2500/lower_a` | `media-root-rw-pxe_src2500-lower_a.mount` | `media-root\x2drw-pxe_src2500-lower_a.mount` |
+
+**解决方案**:
+使用 `systemd-escape` 工具自动转义：
+```bash
+MOUNT_UNIT=$(systemd-escape --path --suffix=mount "$MOUNT_POINT")
+# /media/root-rw/log → media-root\x2drw-log.mount
+```
+
+**验证方法**:
+```bash
+# 检查转义是否正确
+systemd-escape --path /media/root-rw/log
+# 输出：media-root\x2drw-log
+
+# 验证 mount 单元
+systemd-analyze verify /etc/systemd/system/media-root\x2drw-log.mount
+# 应无错误输出
+```
+
+**bind mount 依赖关系**:
+```bash
+# bind mount 单元中的 Requires/After 也必须使用转义后的单元名
+LOG_MOUNT_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/log)
+BIND_MOUNT_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/pxe_src2500/log)
+
+cat > "/etc/systemd/system/$BIND_MOUNT_UNIT" <<EOF
+[Unit]
+Description=Bind mount log directory to pxe_src2500
+Requires=$LOG_MOUNT_UNIT
+After=$LOG_MOUNT_UNIT
+...
+EOF
+```
+
+---
+
+### 问题 6: 脚本逻辑缺陷 - 只检查第一个分区
+
+**发现日期**: 2025-04-02
+**影响**: 导致部分分区未格式化，目录缺失
+
+**现象**:
+```bash
+# 脚本只检查第一个分区
+if [ ! -e "/dev/disk/by-partlabel/pxe_lower_a" ]; then
+    # 创建所有分区并格式化
+    ...
+fi
+
+# 实际情况：
+# - pxe_lower_a 存在且已格式化 → 跳过整个 if 块
+# - pxe_lower_b 存在但未格式化 → 未处理
+# - pxe_upper 存在但未格式化 → 未处理
+
+# 结果：只有 lower_a 目录被创建
+ls /media/root-rw/pxe_src2500/
+# log/  lower_a/  (缺少 lower_b/ 和 upper/)
+```
+
+**根本原因**:
+脚本使用"第一个分区是否存在"来判断"是否需要执行创建流程"，但实际需求是：
+- **分区创建**：可以跳过（如果已存在）
+- **格式化**：必须检查每个分区（可能未格式化）
+- **挂载**：必须检查每个分区（可能未挂载）
+
+**解决方案**:
+将脚本拆分为两个独立的逻辑：
+
+1. **分区创建逻辑**（只在所有分区不存在时执行）:
+```bash
+PARTITIONS_EXIST=true
+for PART_NAME in pxe_lower_a pxe_lower_b pxe_upper; do
+    if [ ! -e "/dev/disk/by-partlabel/$PART_NAME" ]; then
+        PARTITIONS_EXIST=false
+        break
+    fi
+done
+
+if [ "$PARTITIONS_EXIST" = false ]; then
+    # 创建所有分区
+    ...
+fi
+```
+
+2. **格式化和挂载逻辑**（对每个分区单独执行）:
+```bash
+for PART_NAME in pxe_lower_a pxe_lower_b pxe_upper; do
+    # 等待分区设备出现
+    for i in {1..30}; do
+        [ -e "/dev/disk/by-partlabel/$PART_NAME" ] && break
+        sleep 1
+    done
+
+    PART_DEV=$(readlink -f "/dev/disk/by-partlabel/$PART_NAME")
+
+    # 检查是否已格式化
+    if ! blkid -o value -s TYPE "$PART_DEV" | grep -q ext4; then
+        echo "Formatting $PART_NAME: $PART_DEV"
+        mkfs.ext4 -F -L "$PART_NAME" "$PART_DEV"
+    fi
+
+    # 创建挂载点和 mount 单元
+    MOUNT_POINT="/media/root-rw/pxe_src2500/${PART_NAME#pxe_}"
+    mkdir -p "$MOUNT_POINT"
+    MOUNT_UNIT=$(systemd-escape --path --suffix=mount "$MOUNT_POINT")
+
+    # 创建 mount 单元文件...
+
+    # 检查是否已挂载
+    if ! mountpoint -q "$MOUNT_POINT"; then
+        systemctl enable "$MOUNT_UNIT"
+        systemctl start "$MOUNT_UNIT"
+    fi
+done
+```
+
+**检查命令**:
+```bash
+# 检查分区是否格式化
+blkid -o value -s TYPE /dev/mmcblk0p6
+# 输出：ext4（已格式化）或空（未格式化）
+
+# 检查挂载点是否已挂载
+mountpoint -q /media/root-rw/pxe_src2500/lower_b
+# 返回值：0（已挂载）或 1（未挂载）
+```
+
+**修复后的效果**:
+```bash
+# 所有分区都被正确处理
+ls /media/root-rw/pxe_src2500/
+# log/  lower_a/  lower_b/  upper/
+
+# 所有分区都已挂载
+mount | grep pxe_src2500
+# /dev/mmcblk0p5 on /media/root-rw/pxe_src2500/lower_a
+# /dev/mmcblk0p6 on /media/root-rw/pxe_src2500/lower_b
+# /dev/mmcblk0p7 on /media/root-rw/pxe_src2500/upper
+```
+
+---
+
 ## 提取的 SOP
 
 ### SOP 1: 创建分区自动划分脚本
@@ -217,8 +391,9 @@ PART_DEV="${BOOT_DEV}p${PART_NUM}"
 
 **关键点**:
 - 使用 PARTLABEL 而非分区号（设备无关）
-- 分区名中的 `-` 转义为 `\x2d`
-- 添加幂等性检查（`[ ! -e "/dev/disk/by-partlabel/..." ]`）
+- 使用 `systemd-escape --path --suffix=mount` 转义路径
+- 检查每个分区是否已格式化（`blkid`）
+- 检查挂载点是否已挂载（`mountpoint`）
 
 ### SOP 2: 验证扇区计算
 
@@ -278,6 +453,106 @@ cat /pxe_rootfs_a/test.txt  # 应输出 "test"
 
 ---
 
+### SOP 5: 正确创建 systemd mount 单元（2025-04-02 更新）
+
+**适用场景**: 需要创建持久化的自动挂载配置
+
+**关键点**:
+1. **使用 `systemd-escape` 工具**（不要手动转义）
+2. **对每个分区单独检查格式化状态**（不要只检查第一个）
+3. **检查挂载点是否已挂载**（避免重复挂载）
+
+**完整流程**:
+```bash
+# 1. 获取分区设备路径
+PART_DEV=$(readlink -f "/dev/disk/by-partlabel/$PART_NAME")
+
+# 2. 检查是否已格式化
+if ! blkid -o value -s TYPE "$PART_DEV" | grep -q ext4; then
+    echo "Formatting $PART_NAME: $PART_DEV"
+    mkfs.ext4 -F -L "$PART_NAME" "$PART_DEV"
+fi
+
+# 3. 计算挂载点路径
+MOUNT_POINT="/media/root-rw/pxe_src2500/${PART_NAME#pxe_}"
+
+# 4. 创建挂载点目录
+mkdir -p "$MOUNT_POINT"
+
+# 5. 使用 systemd-escape 获取正确的单元名
+MOUNT_UNIT=$(systemd-escape --path --suffix=mount "$MOUNT_POINT")
+
+# 6. 创建 mount 单元文件
+cat > "/etc/systemd/system/$MOUNT_UNIT" <<EOF
+[Unit]
+Description=Mount partition $PART_NAME
+DefaultDependencies=no
+
+[Mount]
+What=PARTLABEL=$PART_NAME
+Where=$MOUNT_POINT
+Type=ext4
+Options=defaults
+
+[Install]
+WantedBy=local-fs.target
+EOF
+
+# 7. 检查是否已挂载
+if ! mountpoint -q "$MOUNT_POINT"; then
+    systemctl daemon-reload
+    systemctl enable "$MOUNT_UNIT"
+    systemctl start "$MOUNT_UNIT"
+fi
+```
+
+**bind mount 示例**:
+```bash
+# 主挂载点
+LOG_MOUNT_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/log)
+
+# bind mount 点
+BIND_MOUNT_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/pxe_src2500/log)
+
+# bind mount 单元中的依赖关系必须使用转义后的单元名
+cat > "/etc/systemd/system/$BIND_MOUNT_UNIT" <<EOF
+[Unit]
+Description=Bind mount log directory to pxe_src2500
+Requires=$LOG_MOUNT_UNIT
+After=$LOG_MOUNT_UNIT
+Before=local-fs.target
+
+[Mount]
+What=/media/root-rw/log
+Where=/media/root-rw/pxe_src2500/log
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target
+EOF
+```
+
+**验证命令**:
+```bash
+# 验证 mount 单元文件名
+systemd-escape --path /media/root-rw/log
+# 输出：media-root\x2drw-log
+
+# 验证 mount 单元配置
+systemd-analyze verify /etc/systemd/system/media-root\x2drw-log.mount
+# 应无错误输出
+
+# 检查分区格式化状态
+blkid -o value -s TYPE /dev/mmcblk0p8
+# 输出：ext4（已格式化）或空（未格式化）
+
+# 检查挂载状态
+mountpoint -q /media/root-rw/log && echo "mounted" || echo "not mounted"
+```
+
+---
+
 ## 理论补课
 
 ### 知识点 1: GPT 分区表（GUID Partition Table）
@@ -301,7 +576,7 @@ cat /pxe_rootfs_a/test.txt  # 应输出 "test"
 
 **关键内容**:
 - systemd 使用 `.mount` 单元管理挂载点
-- 单元文件名必须转义特殊字符（`-` → `\x2d`）
+- 单元文件名必须从挂载路径转义（使用 `systemd-escape`）
 - 支持依赖管理（`WantedBy=local-fs.target`）
 - 可使用 `PARTLABEL=` 实现设备无关挂载
 
@@ -339,6 +614,92 @@ cat /pxe_rootfs_a/test.txt  # 应输出 "test"
 - 计算分区起始位置和大小
 - 验证分区无缝连接
 - 避免分区重叠或间隙
+
+---
+
+### 知识点 5: systemd-escape 工具（2025-04-02 新增）
+
+**来源**: 实际调试 mount 单元失败问题
+
+**关键内容**:
+- `systemd-escape` 是 systemd 提供的转义工具
+- 用于将路径/单元名转换为 systemd 单元文件名格式
+- 支持 `--path` 模式转义文件系统路径
+- 支持 `--suffix=` 添加单元类型后缀
+
+**转义规则**:
+1. **路径转义**（`--path` 模式）:
+   - 去掉开头的 `/`
+   - 将 `/` 替换为 `-`
+   - 将 `-` 替换为 `\x2d`（字面字符，非 ASCII 码）
+   - 将 `\` 替换为 `\\`
+   - 将 `.` 和 `_` 等特殊字符也会被转义
+
+2. **示例**:
+```bash
+# 基本用法
+systemd-escape --path /media/root-rw/log
+# 输出：media-root\x2drw-log
+
+# 带后缀
+systemd-escape --path --suffix=mount /media/root-rw/log
+# 输出：media-root\x2drw-log.mount
+
+# 复杂路径
+systemd-escape --path /media/root-rw/pxe_src2500/lower_a
+# 输出：media-root\x2drw-pxe_src2500-lower_a
+```
+
+**为什么不能手动转义**:
+```bash
+# 错误示例 1：只转义了 /，没有转义 -
+echo "/media/root-rw/log" | sed 's/^\///;s/\//-/g'
+# 输出：media-root-rw-log（错误！systemd 会拒绝）
+
+# 错误示例 2：使用 bash 替换
+PATH="/media/root-rw/log"
+echo "${PATH//-/\\x2d}" | sed 's/^\///;s/\//-/g'
+# 输出：media-root\x2drw-log（看起来对，但容易出错）
+
+# 正确做法：使用 systemd-escape
+systemd-escape --path /media/root-rw/log
+# 输出：media-root\x2drw-log（保证正确）
+```
+
+**单元名验证**:
+```bash
+# 生成单元名
+UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/log)
+
+# 验证单元配置
+systemd-analyze verify "/etc/systemd/system/$UNIT"
+# 无输出 = 验证通过
+
+# 检查单元文件名中的字节
+echo "$UNIT" | od -An -tx1c
+# 输出：... 5c 78 32 64 ...
+#      \x2d 的字节码是 5c(\) 78(x) 32(2) 64(d)
+```
+
+**bind mount 依赖关系**:
+```bash
+# bind mount 单元中的 Requires/After 必须使用转义后的单元名
+LOG_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/log)
+BIND_UNIT=$(systemd-escape --path --suffix=mount /media/root-rw/pxe_src2500/log)
+
+cat > "/etc/systemd/system/$BIND_UNIT" <<EOF
+[Unit]
+Requires=$LOG_UNIT    # 必须使用转义后的单元名
+After=$LOG_UNIT       # 不能使用 /media/root-rw/log.mount
+...
+EOF
+```
+
+**应用场景**:
+- 创建 systemd mount 单元时自动转义路径
+- 验证手动编写的单元名是否正确
+- 在脚本中动态生成单元文件名
+- 理解 systemd 日志中的单元名显示
 
 ---
 
@@ -488,6 +849,53 @@ cat /pxe_rootfs_a/test.txt  # 应输出 "test"
 
 ---
 
+## 修复记录（2025-04-02）
+
+### 问题发现
+在首次硬件测试中发现两个关键问题：
+1. **systemd mount 单元文件名转义错误**：使用 `sed` 手动转义无法正确处理路径中的 `-` 字符
+2. **脚本逻辑缺陷**：只检查第一个分区是否存在，导致后续分区未格式化
+
+### 修复内容
+1. **替换转义方法**：
+   - 从：`echo "$MOUNT_POINT" | sed 's/^\///;s/\//-/g'`
+   - 到：`systemd-escape --path --suffix=mount "$MOUNT_POINT"`
+
+2. **重构脚本逻辑**：
+   - 分离"分区创建"和"格式化挂载"两个独立逻辑
+   - 对每个分区单独检查格式化状态（使用 `blkid`）
+   - 对每个挂载点单独检查挂载状态（使用 `mountpoint`）
+
+3. **新增 SOP**：
+   - SOP 5: 正确创建 systemd mount 单元
+
+4. **新增知识点**：
+   - 知识点 5: systemd-escape 工具
+
+### 测试结果
+```bash
+# 所有分区正确挂载
+ls /media/root-rw/pxe_src2500/
+# log/  lower_a/  lower_b/  upper/
+
+# 所有 mount 单元正确命名
+systemctl list-unit-files | grep 'media.*mount'
+# media-root\x2drw-log.mount                 enabled
+# media-root\x2drw-pxe_src2500-log.mount     enabled
+# media-root\x2drw-pxe_src2500-lower_a.mount enabled
+# media-root\x2drw-pxe_src2500-lower_b.mount enabled
+# media-root\x2drw-pxe_src2500-upper.mount   enabled
+```
+
+### 经验教训
+1. **systemd 转义规则复杂**：必须使用 `systemd-escape` 工具，不能手动转义
+2. **脚本逻辑要完整**：不能只检查第一个分区来判断整体状态
+3. **硬件测试至关重要**：模拟环境无法发现所有问题
+
+---
+
 **文档生成时间**: 2025-03-31
+**最后更新时间**: 2025-04-02
 **工作流耗时**: 约 45 分钟（架构 15 分钟 + 开发 20 分钟 + 测试 10 分钟）
-**质量评估**: 开发完成，等待硬件验证
+**修复耗时**: 约 2 小时（调试 + 修复 + 验证）
+**质量评估**: ✅ 已通过硬件测试，可以正式使用
